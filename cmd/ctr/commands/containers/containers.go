@@ -344,7 +344,9 @@ var updateCommand = cli.Command{
 		}
 		// m := v.(*cricontainer.Metadata)
 		m := v.(*containerstore.Metadata)
-		m.Config.Annotations["io.kubernetes.container.hash"] = strconv.FormatUint(HashContainer(&info), 16)
+		hash := strconv.FormatUint(HashContainer(&info), 16)
+		fmt.Printf("Updating container %q hash to %s\n", id, hash)
+		m.Config.Annotations["io.kubernetes.container.hash"] = hash
 		newmetadata, err := typeurl.MarshalAny(m)
 		if err != nil {
 			return err
@@ -391,9 +393,16 @@ func HashContainer(container *containers.Container) uint64 {
 }
 
 func pickFieldsToHash(container *containers.Container) map[string]string {
+	// imageの先頭に"docker.io/"が含まれていたら取り除く
+	image := container.Image
+	if strings.HasPrefix(image, "docker.io/") {
+		image = strings.TrimPrefix(image, "docker.io/")
+	}
+
+	fmt.Printf("name: %s, image: %s\n", container.Labels["io.kubernetes.container.name"], image)
 	retval := map[string]string{
 		"name":  container.Labels["io.kubernetes.container.name"], // pod.spec.containers[].name に対応
-		"image": container.Image,
+		"image": image,
 	}
 	return retval
 }
