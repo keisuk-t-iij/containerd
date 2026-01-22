@@ -18,8 +18,12 @@ package containers
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -28,7 +32,11 @@ import (
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/cmd/ctr/commands/run"
 	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd/dump"
 	"github.com/containerd/containerd/errdefs"
+
+	// cricontainer "github.com/containerd/cri/pkg/store/container"
+	containerstore "github.com/containerd/containerd/pkg/cri/store/container"
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 	"github.com/urfave/cli"
@@ -47,6 +55,7 @@ var Command = cli.Command{
 		setLabelsCommand,
 		checkpointCommand,
 		restoreCommand,
+		updateCommand,
 	},
 }
 
@@ -298,4 +307,145 @@ var infoCommand = cli.Command{
 		commands.PrintAsJSON(info)
 		return nil
 	},
+}
+
+const defaultContainersFile = "containers.json"
+
+var updateCommand = cli.Command{
+	Name:      "update",
+	Usage:     "Update about a container",
+	ArgsUsage: "CONTAINER",
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "file, f",
+			Value: defaultContainersFile,
+			Usage: "path to containers metadata file",
+		},
+	},
+	Action: func(context *cli.Context) error {
+		id := context.Args().First()
+		if id == "" {
+			return fmt.Errorf("container id must be provided: %w", errdefs.ErrInvalidArgument)
+		}
+		client, ctx, cancel, err := commands.NewClient(context)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		container, err := client.LoadContainer(ctx, id)
+		if err != nil {
+			return err
+		}
+		info, err := container.Info(ctx, containerd.WithoutRefreshedMetadata)
+		if err != nil {
+			return err
+		}
+
+		// hashの書き換え
+		metadata, ok := info.Extensions["io.cri-containerd.container.metadata"]
+		if !ok {
+			return fmt.Errorf("container %q does not have CRI metadata", id)
+		}
+		v, err := typeurl.UnmarshalAny(metadata)
+		if err != nil {
+			return err
+		}
+
+		images, _ := loadImages(context.String("file"))
+
+		// m := v.(*cricontainer.Metadata)
+		m := v.(*containerstore.Metadata)
+		hash := strconv.FormatUint(HashContainer(&info, id, images), 16)
+		fmt.Printf("Updating container %q hash to %s\n", id, hash)
+		m.Config.Annotations["io.kubernetes.container.hash"] = hash
+		newmetadata, err := typeurl.MarshalAny(m)
+		if err != nil {
+			return err
+		}
+
+		// Extensionの書き換え
+		opt := WithContainerExtension("io.cri-containerd.container.metadata", newmetadata)
+		if err := container.Update(ctx, containerd.UpdateContainerOpts(opt)); err != nil {
+			return err
+		}
+		return nil
+	},
+}
+
+// containerd.UpdateContainerOpts とほぼ同じだが、NewContainerOpsではなくUpdateContainerOptsとして実装している
+func WithContainerExtension(name string, extension interface{}) containerd.UpdateContainerOpts {
+	return func(ctx context.Context, client *containerd.Client, c *containers.Container) error {
+		if name == "" {
+			return fmt.Errorf("extension key must not be zero-length: %w", errdefs.ErrInvalidArgument)
+		}
+
+		any, err := typeurl.MarshalAny(extension)
+		if err != nil {
+			if errors.Is(err, typeurl.ErrNotFound) {
+				return fmt.Errorf("extension %q is not registered with the typeurl package, see `typeurl.Register`: %w", name, err)
+			}
+			return fmt.Errorf("error marshalling extension: %w", err)
+		}
+
+		if c.Extensions == nil {
+			c.Extensions = make(map[string]typeurl.Any)
+		}
+		c.Extensions[name] = any
+		return nil
+	}
+}
+
+func HashContainer(container *containers.Container, id string, imageOverrides map[string]string) uint64 {
+	hasher := fnv.New32a()
+	containerJSON, _ := json.Marshal(pickFieldsToHash(container, id, imageOverrides))
+	hasher.Reset()
+	fmt.Fprintf(hasher, "%v", dump.ForHash(containerJSON))
+	return uint64(hasher.Sum32())
+}
+
+func pickFieldsToHash(container *containers.Container, id string, imageOverrides map[string]string) map[string]string {
+	image := overrideImage(imageOverrides, id, container.Image)
+	fmt.Printf("name: %s, image: %s\n", container.Labels["io.kubernetes.container.name"], image)
+	retval := map[string]string{
+		"name":  container.Labels["io.kubernetes.container.name"], // pod.spec.containers[].name に対応
+		"image": image,
+	}
+	return retval
+}
+
+func loadImages(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var containers []struct {
+		ContainerID string `json:"containerID"`
+		Image       string `json:"image"`
+	}
+	if err := json.NewDecoder(file).Decode(&containers); err != nil {
+		return nil, err
+	}
+
+	images := make(map[string]string, len(containers))
+	for _, c := range containers {
+		images[c.ContainerID] = c.Image
+	}
+	return images, nil
+}
+
+func overrideImage(imageOverrides map[string]string, id, fallback string) string {
+	if imageOverrides == nil {
+		return fallback
+	}
+	if override, ok := imageOverrides[id]; ok && override != "" {
+		return override
+	}
+	return fallback
+}
+
+func init() {
+	typeurl.Register(&containerstore.Metadata{},
+		"github.com/containerd/cri/pkg/store/container", "Metadata")
 }
