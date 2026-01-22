@@ -309,11 +309,19 @@ var infoCommand = cli.Command{
 	},
 }
 
+const defaultContainersFile = "containers.json"
+
 var updateCommand = cli.Command{
 	Name:      "update",
 	Usage:     "Update about a container",
 	ArgsUsage: "CONTAINER",
-	Flags:     []cli.Flag{},
+	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "file, f",
+			Value: defaultContainersFile,
+			Usage: "path to containers metadata file",
+		},
+	},
 	Action: func(context *cli.Context) error {
 		id := context.Args().First()
 		if id == "" {
@@ -342,9 +350,12 @@ var updateCommand = cli.Command{
 		if err != nil {
 			return err
 		}
+
+		images, _ := loadImages(context.String("file"))
+
 		// m := v.(*cricontainer.Metadata)
 		m := v.(*containerstore.Metadata)
-		hash := strconv.FormatUint(HashContainer(&info), 16)
+		hash := strconv.FormatUint(HashContainer(&info, id, images), 16)
 		fmt.Printf("Updating container %q hash to %s\n", id, hash)
 		m.Config.Annotations["io.kubernetes.container.hash"] = hash
 		newmetadata, err := typeurl.MarshalAny(m)
@@ -384,27 +395,54 @@ func WithContainerExtension(name string, extension interface{}) containerd.Updat
 	}
 }
 
-func HashContainer(container *containers.Container) uint64 {
+func HashContainer(container *containers.Container, id string, imageOverrides map[string]string) uint64 {
 	hasher := fnv.New32a()
-	containerJSON, _ := json.Marshal(pickFieldsToHash(container))
+	containerJSON, _ := json.Marshal(pickFieldsToHash(container, id, imageOverrides))
 	hasher.Reset()
 	fmt.Fprintf(hasher, "%v", dump.ForHash(containerJSON))
 	return uint64(hasher.Sum32())
 }
 
-func pickFieldsToHash(container *containers.Container) map[string]string {
-	// imageの先頭に"docker.io/"が含まれていたら取り除く
-	image := container.Image
-	if strings.HasPrefix(image, "docker.io/") {
-		image = strings.TrimPrefix(image, "docker.io/")
-	}
-
+func pickFieldsToHash(container *containers.Container, id string, imageOverrides map[string]string) map[string]string {
+	image := overrideImage(imageOverrides, id, container.Image)
 	fmt.Printf("name: %s, image: %s\n", container.Labels["io.kubernetes.container.name"], image)
 	retval := map[string]string{
 		"name":  container.Labels["io.kubernetes.container.name"], // pod.spec.containers[].name に対応
 		"image": image,
 	}
 	return retval
+}
+
+func loadImages(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var containers []struct {
+		ContainerID string `json:"containerID"`
+		Image       string `json:"image"`
+	}
+	if err := json.NewDecoder(file).Decode(&containers); err != nil {
+		return nil, err
+	}
+
+	images := make(map[string]string, len(containers))
+	for _, c := range containers {
+		images[c.ContainerID] = c.Image
+	}
+	return images, nil
+}
+
+func overrideImage(imageOverrides map[string]string, id, fallback string) string {
+	if imageOverrides == nil {
+		return fallback
+	}
+	if override, ok := imageOverrides[id]; ok && override != "" {
+		return override
+	}
+	return fallback
 }
 
 func init() {
